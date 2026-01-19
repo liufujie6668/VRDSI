@@ -1,0 +1,724 @@
+-- =============================================
+-- AUTHOR:     <AUTHOR,,LIUFUJIE>
+-- CREATE DATE: <CREATE DATE, 202511221102,>
+-- DESCRIPTION: <DESCRIPTION, 财务周转天数报表,>
+-- =============================================
+ALTER PROCEDURE VOIR_QYBG_SCM_DOI_UPDATEMATERIALPSI @MATERIALPSITEMPTABLENAME VARCHAR(50),
+                                                    @DSI_DATE DATE,
+                                                    @INVAgeAnalyzeRPTTableName VARCHAR(50)
+AS
+BEGIN
+    DECLARE @ADJUSTED_DATE DATE;
+    DECLARE @OFFSET INT;
+    DECLARE @DAY_OF_MONTH INT;
+    DECLARE @FIRST_DAY_OF_WEEK DATE;
+    DECLARE @LAST_DAY_OF_WEEK DATE;
+    DECLARE @PSI_MONTH VARCHAR(50);
+    DECLARE @MONTHRN VARCHAR(50);
+    DECLARE @PSI_WEEK VARCHAR(50);
+    -- 销售字段
+    DECLARE @SAL_OUT_AMOUNT DECIMAL(18, 2) = 0;
+    DECLARE @SAL_JC_AMOUNT DECIMAL(18, 2) = 0;
+    DECLARE @SAL_SAL_AMOUNT DECIMAL(18, 2) = 0;
+    -- 采购字段
+    DECLARE @PUR_OUT_AMOUNT DECIMAL(18, 2) = 0;
+    DECLARE @PUR_JC_AMOUNT DECIMAL(18, 2) = 0;
+    DECLARE @PUR_SAL_AMOUNT DECIMAL(18, 2) = 0;
+
+    --  TODO:查看数据使用，后续删除  START
+    IF OBJECT_ID('TEMPMATERIALPSI', 'U') IS NOT NULL DROP TABLE TEMPMATERIALPSI;
+    DECLARE @SQL NVARCHAR(MAX) = 'SELECT ''' + @MATERIALPSITEMPTABLENAME + CONVERT(VARCHAR(50), @DSI_DATE) +
+                                 ''' AS TABLENAME, * INTO TEMPMATERIALPSI FROM ' + @MATERIALPSITEMPTABLENAME;
+    EXEC (@SQL);
+    --  TODO:查看数据使用，后续删除  END
+
+    -- 无入参，则以当前时间作为参数
+    --  IF OBJECT_ID('@DSI_DATE', 'U') IS NULL SET @DSI_DATE = GETDATE();
+
+    -- 计算和周四的偏移量
+    SET @OFFSET = 4 - (DATEPART(WEEKDAY, @DSI_DATE) - 1);
+    -- 周四、五、六、日的日期调整为本周四，周一、二、三的日期调整为上周四，保证都是从周四开始取数
+    IF @OFFSET >= 0
+        SET @ADJUSTED_DATE = DATEADD(DAY, @OFFSET, @DSI_DATE);
+    ELSE
+        SET @ADJUSTED_DATE = DATEADD(DAY, -@OFFSET - 7, @DSI_DATE);
+
+    SET @DAY_OF_MONTH = DATEPART(DAY, @ADJUSTED_DATE);
+    SET @FIRST_DAY_OF_WEEK = DATEADD(DAY, 1 - DATEPART(WEEKDAY, @ADJUSTED_DATE) + 1, @ADJUSTED_DATE);
+    SET @LAST_DAY_OF_WEEK = DATEADD(DAY, 7 - DATEPART(WEEKDAY, @ADJUSTED_DATE) + 1, @ADJUSTED_DATE);
+
+    --  格式化日期，避免时分秒影响取值范围
+    SET @ADJUSTED_DATE = CONVERT(DATE, @ADJUSTED_DATE);
+
+    --  非跨月周则取当前月份作为PSI月份
+    --  跨月周，则判断当天是否小于4号，若小于，则说明上个月该周占有天数更多，应归属上个月，否则归属当月
+    IF MONTH(@FIRST_DAY_OF_WEEK) <> MONTH(@LAST_DAY_OF_WEEK) AND @DAY_OF_MONTH < 4
+        SET @PSI_MONTH = CONCAT('M', FORMAT(DATEADD(MONTH, -1, @ADJUSTED_DATE), 'yyMM'));
+    ELSE
+        SET @PSI_MONTH = CONCAT('M', FORMAT(@ADJUSTED_DATE, 'yyMM'));
+
+    --  获取周数
+    SELECT @MONTHRN = CASE
+                          WHEN COUNT(1) + 1 < 10 THEN '0' + CONVERT(VARCHAR(50), COUNT(1) + 1)
+                          ELSE CONVERT(VARCHAR(50), COUNT(1) + 1) END
+    FROM T_DSI_RESULT T
+    WHERE T.DSIMonth = @PSI_MONTH
+      AND T.DSIWeek LIKE '%W%'
+      AND T.DSIType = 'S';
+    SET @PSI_WEEK =
+            CONCAT(@PSI_MONTH, 'W', @MONTHRN, '(',
+                   FORMAT(DATEADD(DAY, -7, @ADJUSTED_DATE), 'MMdd'), '~',
+                   FORMAT(DATEADD(DAY, -1, @ADJUSTED_DATE), 'MMdd'), ')');
+
+    --  临时表清空
+    TRUNCATE TABLE TMP_SAL_ORDER_DETAIL;
+    TRUNCATE TABLE TMP_PUR_ORDER_DETAIL;
+    IF OBJECT_ID('TEMP_BOM_LIST', 'U') IS NOT NULL DROP TABLE TEMP_BOM_LIST;
+    --  中间表当前版本数据清掉
+    DELETE FROM MID_MATERIAL_PSI WHERE DSIWEEK = @PSI_WEEK AND DSIMONTH = @PSI_MONTH;
+    DELETE FROM MID_INV_PSI WHERE DSIWEEK = @PSI_WEEK AND DSIMONTH = @PSI_MONTH;
+    DELETE FROM MID_SAL_ORDER_DETAIL WHERE DSIWEEK = @PSI_WEEK AND DSIMONTH = @PSI_MONTH;
+    DELETE FROM MID_PUR_ORDER_DETAIL WHERE DSIWEEK = @PSI_WEEK AND DSIMONTH = @PSI_MONTH;
+    -- 结果表当前版本数据清掉
+    DELETE FROM T_DSI_RESULT WHERE DSIWEEK = @PSI_WEEK AND DSIMONTH = @PSI_MONTH;
+    -- 月份数据清掉重新汇总
+    DELETE FROM T_DSI_RESULT WHERE DSIWEEK = @PSI_MONTH AND DSIMONTH = @PSI_MONTH;
+
+    --  物料收发明细表数据保存在历史明细表中
+    DECLARE @MATERIAL_SQL NVARCHAR(MAX) =
+        'INSERT INTO MID_MATERIAL_PSI(DSIMONTH, DSIWEEK, FMATERIALNUMBER, FMATERIALNAME, FOWNERTYPENAME, FOWNERNAME, FSTOCKNAME, FSTOCKUNITNAME, FSTOCKQCQTY, FSTOCKINQTY, FSTOCKOUTQTY, FSTOCKJCQTY, FMATERIALID, FSTOCKID, FSTOCKNUMBER, FMATERIALMODEL, PRICE, CREATEDATE, PRICESOURCE)
+         SELECT @PSI_MONTH,@PSI_WEEK,FMATERIALNUMBER,FMATERIALNAME,FOWNERTYPENAME,FOWNERNAME,FSTOCKNAME,FSTOCKUNITNAME,FSTOCKQCQTY,FSTOCKINQTY,FSTOCKOUTQTY,FSTOCKJCQTY,FMATERIALID,FSTOCKID,FSTOCKNUMBER,FMATERIALMODEL,0,GETDATE(),0
+        FROM ' + @MATERIALPSITEMPTABLENAME;
+    INSERT INTO T_SQL_TEXT VALUES ('MID_MATERIAL_PSI', @MATERIAL_SQL, GETDATE());
+    EXEC SP_EXECUTESQL @MATERIAL_SQL,
+         N'@PSI_MONTH VARCHAR(50), @PSI_WEEK VARCHAR(50)',
+         @PSI_MONTH, @PSI_WEEK;
+
+    -- 库存账龄分析表保存在历史中
+    --  TODO:先查看字段，确定字段后再做处理 START
+    IF OBJECT_ID('MID_INV_AGE', 'U') IS NOT NULL DROP TABLE MID_INV_AGE;
+    DECLARE @MID_INV_AGE_SQL NVARCHAR(MAX) =
+        'SELECT * INTO MID_INV_AGE FROM ' + @INVAgeAnalyzeRPTTableName
+    EXEC(@MID_INV_AGE_SQL);
+    --  TODO:先查看字段，确定字段后再做处理 END
+
+    -- 准备单价写入数据MID_MATERIAL_PSI单价 START
+    -- 数据存在中间表中
+    INSERT INTO MID_INV_PSI(DSIMONTH, DSIWEEK, FYEAR, FMONTH, KJHSTX, HZ, KCZZ, MATERIALCODE, BEGINQTY,
+                            BEGINAMOUNT, BEGINPRICE, INQTY, INAMOUNT, INPRICE, OUTQTY, OUTAMOUNT, OUTPRICE,
+                            ENDQTY, ENDAMOUNT, ENDPRICE, PRICE, CREATEDATE)
+    --按核算维度
+    SELECT @PSI_MONTH,
+           @PSI_WEEK,
+           B.FYEAR,
+           FMONTH,
+           KJHSTX,
+           HZ,
+           KCZZ,
+           MATERIALCODE,
+           BEGINQTY,
+           BEGINAMOUNT,
+           BEGINPRICE,
+           INQTY,
+           INAMOUNT,
+           INPRICE,
+           OUTQTY,
+           OUTAMOUNT,
+           OUTPRICE,
+           ENDQTY,
+           ENDAMOUNT,
+           ENDPRICE,
+           IIF(OUTPRICE = 0, IIF(INPRICE = 0, IIF(ENDPRICE = 0, BEGINPRICE, ENDPRICE), INPRICE),
+               OUTPRICE) PRICE,
+           GETDATE()
+    FROM (SELECT A.FYEAR,
+                 FMONTH,
+                 KJHSTX,
+                 HZ,
+                 KCZZ,
+                 MATERIALCODE,
+                 BEGINQTY,
+                 BEGINAMOUNT,
+                 BEGINPRICE,
+                 INQTY,
+                 INAMOUNT,
+                 INPRICE,
+                 OUTQTY,
+                 OUTAMOUNT,
+                 OUTPRICE,
+                 ENDQTY,
+                 ENDAMOUNT,
+                 ENDPRICE,
+                 ROW_NUMBER() OVER
+                     (PARTITION BY MATERIALCODE ORDER BY FYEAR DESC, FMONTH DESC) RN
+          FROM (SELECT D.FYEAR                                                  FYEAR,
+                       D.FPERIOD                                                FMONTH,
+                       K.FNUMBER                                                KJHSTX,
+                       H.FNUMBER                                                HZ,
+                       H.FNUMBER                                                KCZZ,
+                       A.FNUMBER                                                MATERIALCODE,
+                       SUM(C1.FQTY)                                             BEGINQTY,
+                       SUM(C1.FAMOUNT)                                          BEGINAMOUNT,
+                       IIF(SUM(C1.FQTY) = 0, 0,
+                           SUM(C1.FAMOUNT) / SUM(C1.FQTY))                      BEGINPRICE,
+                       SUM(C.FCURRENTINQTY)                                     INQTY,
+                       SUM(C.FCURRENTINAMOUNT)                                  INAMOUNT,
+                       IIF(SUM(C.FCURRENTINQTY) = 0, 0,
+                           SUM(C.FCURRENTINAMOUNT) / SUM(C.FCURRENTINQTY))      INPRICE,
+                       SUM(C.FOUTSTOCKQTY)                                      OUTQTY,
+                       SUM(C.FCURRENTOUTAMOUNT)                                 OUTAMOUNT,
+                       IIF(SUM(C.FOUTSTOCKQTY) = 0, 0,
+                           SUM(C.FCURRENTOUTAMOUNT) / SUM(C.FOUTSTOCKQTY))      OUTPRICE,
+                       SUM(C.FQTY)                                              ENDQTY,
+                       SUM(IIF(C.FAMOUNT < 0, 0, C.FAMOUNT))                    ENDAMOUNT,
+                       IIF(SUM(C.FQTY) = 0, 0,
+                           SUM(IIF(C.FAMOUNT < 0, 0, C.FAMOUNT)) / SUM(C.FQTY)) ENDPRICE
+                FROM T_BD_MATERIAL A
+                         INNER JOIN T_HS_STOCKDIMENSION B ON A.FMATERIALID = B.FMASTERID
+                         INNER JOIN T_HS_ACCTGRANGE R ON B.FACCTGRANGEID = R.FACCTGRANGEID
+                         INNER JOIN (SELECT *
+                                     FROM T_HS_BALANCE A
+                                     UNION
+                                     SELECT *
+                                     FROM T_HS_BALANCE_H A) C --查询历史期间需要将此表改为 T_HS_BALANCE_H
+                                    ON B.FENTRYID = C.FDIMEENTRYID AND C.FENDINITKEY = 1
+                         LEFT JOIN (SELECT *
+                                    FROM T_HS_BALANCE A
+                                    UNION
+                                    SELECT *
+                                    FROM T_HS_BALANCE_H) C1 --查询历史期间需要将此表改为 T_HS_BALANCE_H
+                                   ON B.FENTRYID = C1.FDIMEENTRYID AND C1.FENDINITKEY = 0 AND C.FID = C1.FID
+                         INNER JOIN T_HS_OUTACCTG D ON D.FID = C.FID
+                         LEFT JOIN T_BD_STOCK G ON B.FSTOCKID = G.FSTOCKID
+                         LEFT JOIN T_BD_LOTMASTER F ON B.FLOTNUMBER = F.FNUMBER
+                         LEFT JOIN T_ORG_ORGANIZATIONS H ON R.FACCTGORGID = H.FORGID
+                         LEFT JOIN T_HS_CALDIMENSIONS J ON C.FDIMENSIONID = J.FDIMENSIONID
+                         LEFT JOIN T_ORG_ACCOUNTSYSTEM K ON J.FACCTSYSTEMID = K.FACCTSYSTEMID
+                WHERE K.FNUMBER = 'KJHSTX01_SYS'--会计核算体系编码
+                  AND H.FNUMBER = '100'--核算组织编码
+                  AND D.FPERIOD < MONTH(@ADJUSTED_DATE) --小于当前期间，重跑数据进行控制
+                --  AND A.FNUMBER = 'VV-P706B-00-KS0'
+                GROUP BY D.FYEAR,
+                         D.FPERIOD,
+                         K.FNUMBER,
+                         H.FNUMBER,
+                         H.FNUMBER,
+                         A.FNUMBER) A
+          WHERE A.BEGINPRICE <> 0
+             OR A.INPRICE <> 0
+             OR A.OUTPRICE <> 0
+             OR A.ENDPRICE <> 0) B
+    WHERE RN = 1;
+
+    -- 优先存货收发存对应物料的发出单价作为单价，以有价格才写入
+    MERGE INTO MID_MATERIAL_PSI A
+    USING (SELECT * FROM MID_INV_PSI WHERE DSIMONTH = @PSI_MONTH AND DSIWEEK = @PSI_WEEK) B
+    ON (A.FMATERIALNUMBER = B.MATERIALCODE
+        AND A.DSIMONTH = B.DSIMONTH
+        AND A.DSIWEEK = B.DSIWEEK
+        AND A.DSIMONTH = @PSI_MONTH
+        AND A.DSIWEEK = @PSI_WEEK
+        AND A.PRICESOURCE = 0)
+    WHEN MATCHED THEN
+        UPDATE
+        SET A.PRICE       = IIF(B.PRICE IS NULL, 0, B.PRICE),
+            A.PRICESOURCE = 1;
+
+    -- 针对为进行成本核算的存货，成品仓、成品仓(新厂)、客退品仓 取《物料清单明细》 START
+    WITH CTE_BASE AS (SELECT BOM.FID                                         FATHER_FID,
+                             BOMCHILD.FID  AS                                FID,
+                             BOMCHILD.FSEQ                                   SEQ,
+                             IIF(BOMCHILD.FBOMID > 0,
+                                 BOMCHILD.FBOMID,
+                                 (SELECT MAX(FID)
+                                  FROM T_ENG_BOM
+                                  WHERE FMATERIALID = BOMCHILD.FMATERIALID)) BOM_ID,
+                             BOM.FMATERIALID                                 FATHER_MATERIAL_ID,
+                             BOMCHILD.FMATERIALID                            MATERIAL_ID,
+                             MBOM.FNUMBER  AS                                FATHER_MATERIAL_CODE,
+                             MCBOM.FNUMBER AS                                MATERIAL_CODE,
+                             COALESCE(C.FPRICE, B.FPRICE, 0)                 PRICE,
+                             CEILING((1 / BOM.FYIELDRATE * 100) * (BOMCHILD.FNUMERATOR / BOMCHILD.FDENOMINATOR) *
+                                     (1 + (BOMCHILD.FSCRAPRATE / 100)) *
+                                     POWER(10, 0) / POWER(10, 0))            QTY
+                      FROM T_ENG_BOM BOM
+                               INNER JOIN T_ENG_BOMCHILD BOMCHILD ON BOM.FID = BOMCHILD.FID
+                               INNER JOIN T_BD_MATERIAL MBOM ON BOM.FMATERIALID = MBOM.FMATERIALID
+                               INNER JOIN T_BD_MATERIAL MCBOM ON BOMCHILD.FMATERIALID = MCBOM.FMATERIALID
+                          -- 取采购价目表最新单价
+                               LEFT JOIN (SELECT TT.FMATERIALID, TT.FPRICE
+                                          FROM (SELECT T.FMATERIALID,
+                                                       T.FPRICE,
+                                                       ROW_NUMBER() OVER (PARTITION BY T.FMATERIALID ORDER BY T.FID DESC, T.FENTRYID DESC) RN
+                                                FROM T_PUR_PRICELISTENTRY T) TT
+                                          WHERE TT.RN = 1) B ON BOMCHILD.FMATERIALID = B.FMATERIALID
+                          -- 取采购订单最新单价
+                               LEFT JOIN (SELECT TT.FMATERIALID, TT.FPRICE
+                                          FROM (SELECT B.FMATERIALID,
+                                                       C.FPRICE,
+                                                       ROW_NUMBER() OVER (PARTITION BY B.FMATERIALID ORDER BY A.FID DESC , C.FENTRYID DESC) RN
+                                                FROM T_PUR_POORDER A
+                                                         INNER JOIN T_PUR_POORDERENTRY B ON A.FID = B.FID
+                                                         INNER JOIN T_PUR_POORDERENTRY_F C ON A.FID = C.FID AND B.FENTRYID = C.FENTRYID) TT
+                                          WHERE TT.RN = 1) C
+                                         ON BOMCHILD.FMATERIALID = C.FMATERIALID
+                               LEFT JOIN T_BD_UNIT UNIT ON BOMCHILD.FUNITID = UNIT.FUNITID
+                      WHERE 1 = 1
+                        --  AND BOM.FMATERIALID = '199303'
+                        --条件可自行指定（非禁用且已审核）
+                        AND BOM.FFORBIDSTATUS = 'A'
+                        AND BOM.FDOCUMENTSTATUS = 'C'),
+         CTE_TREE AS (SELECT A.FATHER_FID                ROOT_ID,
+                             A.FATHER_MATERIAL_ID        ROOT_MATERIAL_ID,
+                             A.FATHER_MATERIAL_CODE      ROOT_MATERIAL_CODE,
+                             CONVERT(VARCHAR(50), A.SEQ) RN,
+                             A.FATHER_FID,
+                             A.BOM_ID,
+                             A.FATHER_MATERIAL_ID,
+                             A.FATHER_MATERIAL_CODE,
+                             A.MATERIAL_ID,
+                             A.MATERIAL_CODE,
+                             A.QTY,
+                             A.PRICE * A.QTY AS          PRICE
+                      FROM CTE_BASE A
+                      WHERE A.FATHER_MATERIAL_ID IN (SELECT DISTINCT T.FMATERIALID
+                                                     FROM MID_MATERIAL_PSI T
+                                                     WHERE T.FSTOCKNUMBER IN (N'CK003', N'CK033', N'CK007')
+                                                       AND T.PRICESOURCE = 0)
+                      UNION ALL
+                      SELECT FA.ROOT_ID,
+                             FA.ROOT_MATERIAL_ID,
+                             FA.ROOT_MATERIAL_CODE,
+                             CONVERT(VARCHAR(50), FA.RN + '.' + CONVERT(VARCHAR(50), SON.SEQ)),
+                             SON.FATHER_FID,
+                             SON.BOM_ID,
+                             FA.MATERIAL_ID,
+                             FA.MATERIAL_CODE,
+                             SON.MATERIAL_ID,
+                             SON.MATERIAL_CODE,
+                             FA.QTY * SON.QTY,
+                             SON.PRICE * (FA.QTY * SON.QTY)
+                      FROM CTE_TREE FA
+                               INNER JOIN CTE_BASE SON
+                                          ON FA.BOM_ID = SON.FATHER_FID)
+    SELECT *
+    INTO TEMP_BOM_LIST
+    FROM CTE_TREE T
+    ORDER BY T.ROOT_ID, T.ROOT_MATERIAL_ID, T.ROOT_MATERIAL_CODE, T.RN;
+
+    --  对BOM展开卷积求和顶层BOM单价并写入
+    MERGE INTO MID_MATERIAL_PSI A
+    USING (SELECT TEMP.ROOT_MATERIAL_ID, SUM(TEMP.PRICE) AS PRICE
+           FROM TEMP_BOM_LIST TEMP
+           WHERE TEMP.BOM_ID IS NULL
+           GROUP BY TEMP.ROOT_MATERIAL_ID) B
+    ON (A.DSIMONTH = @PSI_MONTH
+        AND A.DSIWEEK = @PSI_WEEK
+        AND A.PRICESOURCE = 0
+        AND A.FMATERIALID = B.ROOT_MATERIAL_ID)
+    WHEN MATCHED THEN
+        UPDATE
+        SET A.PRICE       = B.PRICE,
+            A.PRICESOURCE = 2;
+    -- 针对为进行成本核算的存货，成品仓、客退品仓 取《物料清单明细》 END
+
+    --  针对'SA仓', '半成品仓', '包材仓', '超期物料仓', '车间仓', '辅料仓', '工程备件仓', '样件原材料仓', '原材料仓', '治具仓' 中未有金额的物料去获取最新采购订单上的采购单价
+    MERGE INTO MID_MATERIAL_PSI A
+    USING (SELECT TT.FMATERIALID, TT.FPRICE, TT.FSYSPRICE
+           FROM (SELECT A.FMATERIALID,
+                        B.FPRICE,
+                        B.FSYSPRICE,
+                        ROW_NUMBER() OVER (PARTITION BY A.FMATERIALID ORDER BY A.FID DESC) RN
+                 FROM T_PUR_POORDERENTRY A
+                          INNER JOIN T_PUR_POORDERENTRY_F B ON A.FID = B.FID) TT
+           WHERE TT.RN = 1) B
+    ON (A.FMATERIALID = B.FMATERIALID
+        AND A.PRICE = 0
+        AND A.FSTOCKNUMBER IN
+            (N'CK001', N'CK002', N'CK004', N'CK008', N'CK016',
+             N'CK017', N'CK019', N'CK020', N'CK022')
+        AND A.DSIMONTH = @PSI_MONTH
+        AND A.DSIWEEK = @PSI_WEEK)
+    WHEN MATCHED THEN
+        UPDATE
+        SET A.PRICE       = IIF(B.FPRICE IS NULL, 0, B.FPRICE),
+            A.PRICESOURCE = 2;
+
+    -- 准备销售订单数据 START
+    INSERT INTO TMP_SAL_ORDER_DETAIL(FDATE, FBILLTYPEID, FBILLNO, FDOCUMENTSTATUS, FCUSTID_ID, FSALEDEPTID_ID,
+                                     FSALERID_ID, FCLOSESTATUS, FNOTE, FMATERIALID_ID, FUNITID_ID, FQTY, FPRICE,
+                                     FDELIVERYDATE, FISFREE, FAMOUNT_LC, FAMOUNT, FBASEREMAINOUTQTY,
+                                     FMRPCLOSESTATUS, FRECCONDITIONID_ID, FISINCLUDEDTAX, FISPRICEEXCLUDETAX,
+                                     FSETTLECURRID_ID,
+                                     FLOCALCURRID_ID, FBASEUNITID_ID, FSALEORGID, FSALEORGID_ID, FOBJECTTYPEID,
+                                     FID, T2_FENTRYID, T2_FSEQ, CREATEDATE)
+    SELECT T0.FDATE,
+           T0.FBILLTYPEID,
+           T0.FBILLNO,
+           T0.FDOCUMENTSTATUS,
+           T0.FCUSTID,
+           T0.FSALEDEPTID,
+           T0.FSALERID,
+           T0.FCLOSESTATUS,
+           T0.FNOTE,
+           T2.FMATERIALID,
+           T2.FUNITID,
+           T2.FQTY,
+           T2_F.FPRICE,
+           T2_D.FDELIVERYDATE,
+           T2_F.FISFREE,
+           T2_F.FAMOUNT_LC,
+           T2_F.FAMOUNT,
+           T2_R.FBASEREMAINOUTQTY,
+           T2.FMRPCLOSESTATUS,
+           T4.FRECCONDITIONID,
+           T4.FISINCLUDEDTAX,
+           T4.FISPRICEEXCLUDETAX,
+           T4.FSETTLECURRID,
+           T4.FLOCALCURRID,
+           T2.FBASEUNITID,
+           T0.FSALEORGID,
+           T0.FSALEORGID,
+           T0.FOBJECTTYPEID,
+           T0.FID,
+           T2.FENTRYID,
+           T2.FSEQ,
+           GETDATE()
+    FROM T_SAL_ORDER T0
+             LEFT OUTER JOIN T_SAL_ORDERENTRY T2 ON T0.FID = T2.FID
+             LEFT OUTER JOIN T_SAL_ORDERENTRY_F T2_F ON T2.FENTRYID = T2_F.FENTRYID
+             LEFT OUTER JOIN T_SAL_ORDERENTRY_D T2_D ON T2.FENTRYID = T2_D.FENTRYID
+             LEFT OUTER JOIN T_SAL_ORDERENTRY_R T2_R ON T2.FENTRYID = T2_R.FENTRYID
+             LEFT OUTER JOIN T_SAL_ORDERFIN T4 ON T0.FID = T4.FID
+             LEFT OUTER JOIN T_BD_DEPARTMENT_L ST03_L ON T0.FSALEDEPTID = ST03_L.FDEPTID AND ST03_L.FLOCALEID = 2052
+             LEFT OUTER JOIN T_SEC_USER ST011 ON T0.FAPPROVERID = ST011.FUSERID
+    WHERE T0.FSALEORGID = 1
+      AND T0.FDATE >= DATEADD(DAY, -7, @ADJUSTED_DATE)
+      AND T0.FDATE < @ADJUSTED_DATE
+      AND T2.FMRPTERMINATESTATUS = 'A'
+      AND ISNULL(ST011.FNAME, ' ') <> ' '
+      AND (ST03_L.FNAME = N'业务一部' OR ST03_L.FNAME = N'SA')
+      AND T0.FSALEORGID IN (1, 0)
+      AND T0.FOBJECTTYPEID = 'SAL_SALEORDER';
+
+    INSERT INTO MID_SAL_ORDER_DETAIL(DSIMONTH, DSIWEEK, SALDATE, BILLTYPE, BILLNO, DOCUMENTSTATUS, CUSTNAME,
+                                     DEPTNAME, SALUSERNAME,
+                                     CLOSESTATUS, MATERIALNUMBER, MATERIALNAME, UNITNAME, SALQTY, REMAINOUTQTY,
+                                     SALPRICE, AMOUNT_LC, AMOUNT, DELIVERYDATE, NOTE, ISFREE, MRPCLOSESTATUS,
+                                     RECCONDITIONNUMBER, ISPRICEEXCLUDETAX, ISINCLUDEDTAX, CREATEDATE)
+    SELECT @PSI_MONTH,
+           @PSI_WEEK,
+           A.FDATE                                    SALDATE,
+           B.FNAME                                    BILLTYPE,
+           A.FBILLNO                                  BILLNO,
+           CASE
+               WHEN A.FDOCUMENTSTATUS = 'C' THEN N'已审核'
+               WHEN A.FDOCUMENTSTATUS = 'Z' THEN N'暂存'
+               WHEN A.FDOCUMENTSTATUS = 'A' THEN N'创建'
+               WHEN A.FDOCUMENTSTATUS = 'B' THEN N'审核中'
+               WHEN A.FDOCUMENTSTATUS = 'D' THEN N'重新审核'
+               ELSE '' END     AS                     DOCUMENTSTATUS,
+           C.FNAME                                    CUSTNAME,
+           D.FNAME                                    DEPTNAME,
+           E.FNAME                                    SALUSERNAME,
+           CASE
+               WHEN A.FCLOSESTATUS = 'A' THEN N'正常'
+               WHEN A.FCLOSESTATUS = 'B' THEN N'已关闭'
+               ELSE '' END     AS                     CLOSESTATUS,
+           F.FNUMBER                                  MATERIALNUMBER,
+           FL.FNAME                                   MATERIALNAME,
+           G.FNAME                                    UNITNAME,
+           A.FQTY                                     SALQTY,
+           A.FBASEREMAINOUTQTY AS                     REMAINOUTQTY,
+           A.FPRICE                                   SALPRICE,
+           IIF(A.FAMOUNT_LC IS NULL, 0, A.FAMOUNT_LC) AMOUNT_LC,
+           IIF(A.FAMOUNT IS NULL, 0, A.FAMOUNT)       AMOUNT,
+           A.FDELIVERYDATE                            DELIVERYDATE,
+           A.FNOTE                                    NOTE,
+           CASE
+               WHEN A.FISFREE = '1' THEN N'是'
+               WHEN A.FISFREE = '0' THEN N'否'
+               ELSE '' END     AS                     ISFREE,
+           CASE
+               WHEN A.FMRPCLOSESTATUS = 'A' THEN N'未关闭'
+               WHEN A.FMRPCLOSESTATUS = 'B' THEN N'业务关闭'
+               ELSE '' END     AS                     MRPCLOSESTATUS,
+           H.FNAME                                    RECCONDITIONNUMBER,
+           CASE
+               WHEN A.FISPRICEEXCLUDETAX = '1' THEN N'是'
+               WHEN A.FISPRICEEXCLUDETAX = '0' THEN N'否'
+               ELSE '' END     AS                     ISPRICEEXCLUDETAX,
+           CASE
+               WHEN A.FISINCLUDEDTAX = '1' THEN N'是'
+               WHEN A.FISINCLUDEDTAX = '0' THEN N'否'
+               ELSE '' END     AS                     ISINCLUDEDTAX,
+           GETDATE()
+    FROM TMP_SAL_ORDER_DETAIL A
+             LEFT JOIN T_BAS_BILLTYPE_L B ON A.FBILLTYPEID = B.FBILLTYPEID AND B.FLOCALEID = 2052
+             LEFT JOIN T_BD_CUSTOMER_L C ON A.FCUSTID_ID = C.FCUSTID AND C.FLOCALEID = 2052
+             LEFT JOIN T_BD_DEPARTMENT_L D ON A.FSALEDEPTID_ID = D.FDEPTID AND D.FLOCALEID = 2052
+             LEFT JOIN V_BD_SALESMAN_L E ON A.FSALERID_ID = E.FID AND E.FLOCALEID = 2052
+             LEFT JOIN T_BD_MATERIAL F ON A.FMATERIALID_ID = F.FMATERIALID
+             LEFT JOIN T_BD_MATERIAL_L FL ON A.FMATERIALID_ID = FL.FMATERIALID AND FL.FLOCALEID = 2052
+             LEFT JOIN T_BD_UNIT_L G ON A.FUNITID_ID = G.FUNITID AND G.FLOCALEID = 2052
+             LEFT JOIN T_BD_RECCONDITION_L H ON A.FRECCONDITIONID_ID = H.FID AND H.FLOCALEID = 2052;
+    -- 准备销售订单数据 END
+
+    -- 准备采购订单数据 START
+    INSERT INTO TMP_PUR_ORDER_DETAIL(FBILLTYPEID, FBUSINESSTYPE, FBILLNO, FDATE, FSUPPLIERID_ID,
+                                     FDOCUMENTSTATUS, FPURCHASEORGID_ID, FPAYCONDITIONID_ID, FMANUALCLOSE,
+                                     FLOCALCURRID_ID, FCREATORID_ID, FCLOSESTATUS, FCLOSERID_ID, FCLOSEDATE,
+                                     FMATERIALID_ID, FUNITID_ID, FQTY, FPRICE, FTAXPRICE, FENTRYTAXAMOUNT,
+                                     FALLAMOUNT, FAMOUNT_LC, FGIVEAWAY, FENTRYNOTE, FMRPCLOSESTATUS,
+                                     FMRPTERMINATESTATUS, FREMAINSTOCKINQTY, F_JSYJ, FSETTLECURRID_ID,
+                                     FPURCHASEORGID, FOBJECTTYPEID, FID, T3_FENTRYID, T3_FSEQ, FDELIVERYDATE)
+    SELECT T0.FBILLTYPEID         AS FBILLTYPEID,
+           T0.FBUSINESSTYPE       AS FBUSINESSTYPE,
+           T0.FBILLNO             AS FBILLNO,
+           T0.FDATE               AS FDATE,
+           T0.FSUPPLIERID         AS FSUPPLIERID_ID,
+           T0.FDOCUMENTSTATUS     AS FDOCUMENTSTATUS,
+           T0.FPURCHASEORGID      AS FPURCHASEORGID_ID,
+           T1.FPAYCONDITIONID     AS FPAYCONDITIONID_ID,
+           T0.FMANUALCLOSE        AS FMANUALCLOSE,
+           T1.FLOCALCURRID        AS FLOCALCURRID_ID,
+           T0.FCREATORID          AS FCREATORID_ID,
+           T0.FCLOSESTATUS        AS FCLOSESTATUS,
+           T0.FCLOSERID           AS FCLOSERID_ID,
+           T0.FCLOSEDATE          AS FCLOSEDATE,
+           T3.FMATERIALID         AS FMATERIALID_ID,
+           T3.FUNITID             AS FUNITID_ID,
+           T3.FQTY                AS FQTY,
+           T3_F.FPRICE            AS FPRICE,
+           T3_F.FTAXPRICE         AS FTAXPRICE,
+           T3_F.FTAXAMOUNT        AS FENTRYTAXAMOUNT,
+           T3_F.FALLAMOUNT        AS FALLAMOUNT,
+           T3_F.FAMOUNT_LC        AS FAMOUNT_LC,
+           T3.FGIVEAWAY           AS FGIVEAWAY,
+           T3.FNOTE               AS FENTRYNOTE,
+           T3.FMRPCLOSESTATUS     AS FMRPCLOSESTATUS,
+           T3.FMRPTERMINATESTATUS AS FMRPTERMINATESTATUS,
+           T3_R.FREMAINSTOCKINQTY AS FREMAINSTOCKINQTY,
+           T3.F_JSYJ              AS F_JSYJ,
+           T1.FSETTLECURRID       AS FSETTLECURRID_ID,
+           T0.FPURCHASEORGID      AS FPURCHASEORGID,
+           T0.FOBJECTTYPEID       AS FOBJECTTYPEID,
+           T0.FID                 AS FID,
+           T3.FENTRYID            AS T3_FENTRYID,
+           T3.FSEQ                AS T3_FSEQ,
+           T4.FDELIVERYDATE       AS FDELIVERYDATE
+    FROM T_PUR_POORDER T0
+             LEFT JOIN T_PUR_POORDERFIN T1 ON T0.FID = T1.FID
+             LEFT JOIN T_PUR_POORDERENTRY T3 ON T0.FID = T3.FID
+             LEFT JOIN T_PUR_POORDERENTRY_F T3_F ON T3.FENTRYID = T3_F.FENTRYID
+             LEFT JOIN T_PUR_POORDERENTRY_R T3_R ON T3.FENTRYID = T3_R.FENTRYID
+             LEFT JOIN T_PUR_POENTRYDELIPLAN T4 ON T3.FENTRYID = T4.FENTRYID
+             LEFT JOIN T_SEC_USER ST05 ON T0.FCREATORID = ST05.FUSERID
+             LEFT JOIN T_SEC_USER ST07 ON T0.FAPPROVERID = ST07.FUSERID
+    WHERE T0.FDATE >= DATEADD(DAY, -7, @ADJUSTED_DATE)
+      AND T0.FDATE < @ADJUSTED_DATE
+      AND T3.FMRPTERMINATESTATUS = 'A'
+      AND ISNULL(ST07.FNAME, ' ') <> ' '
+      AND ST05.FNAME <> N'H2'
+      AND ST05.FNAME <> N'DH'
+      AND ST05.FNAME NOT LIKE N'%SCU%'
+      AND T0.FPURCHASEORGID = 1
+      AND T0.FPURCHASEORGID IN (1, 0)
+      AND T0.FOBJECTTYPEID = 'PUR_PURCHASEORDER';
+
+    INSERT INTO MID_PUR_ORDER_DETAIL(DSIMONTH, DSIWEEK, BILLTYPE, BUSINESSTYPE, BILLNO, BILLDATE, PAYCONDITION,
+                                     SUPPLIERNAME,
+                                     DOCUMENTSTATUS, PURCHASEORG, CLOSESTATUS, MATERIALNUMBER, MATERIALNAME,
+                                     MATERIALSPECIFICATION, CURRENCYNAME, UNITNAME, PURQTY, REMAINOUTQTY,
+                                     PURPRICE, TAXPRICE, ENTRYTAXAMOUNT, AMOUNT_LC, AMOUNT, DELIVERYDATE,
+                                     ISFREE, NOTE, MRPCLOSESTATUS, JSYJ, MANUALCLOSE, CLOSEUSERNAME, CLOSEDATE,
+                                     CREATORID, MRPTERMINATESTATUS, CREATEDATE)
+    SELECT @PSI_MONTH,
+           @PSI_WEEK,
+           B.FNAME,
+           CASE
+               WHEN A.FBUSINESSTYPE = 'CG' THEN N'标准采购'
+               WHEN A.FBUSINESSTYPE = 'WW' THEN N'标准委外'
+               WHEN A.FBUSINESSTYPE = 'ZCCG' THEN N'资产采购'
+               WHEN A.FBUSINESSTYPE = 'ZYCG' THEN N'直运采购'
+               WHEN A.FBUSINESSTYPE = 'FYCG' THEN N'费用采购'
+               WHEN A.FBUSINESSTYPE = 'VMICG' THEN N'VMI采购'
+               WHEN A.FBUSINESSTYPE = 'DRPCG' THEN N'分销采购'
+               ELSE '' END,
+           A.FBILLNO,
+           A.FDATE,
+           C.FNAME,
+           D.FNAME,
+           CASE
+               WHEN A.FDOCUMENTSTATUS = 'C' THEN N'已审核'
+               WHEN A.FDOCUMENTSTATUS = 'Z' THEN N'暂存'
+               WHEN A.FDOCUMENTSTATUS = 'A' THEN N'创建'
+               WHEN A.FDOCUMENTSTATUS = 'B' THEN N'审核中'
+               WHEN A.FDOCUMENTSTATUS = 'D' THEN N'重新审核'
+               ELSE '' END,
+           N'采购组织',
+           CASE
+               WHEN A.FCLOSESTATUS = 'A' THEN N'正常'
+               WHEN A.FCLOSESTATUS = 'B' THEN N'已关闭'
+               ELSE '' END,
+           E.FNUMBER,
+           EL.FNAME,
+           EL.FSPECIFICATION,
+           F.FNAME,
+           G.FNAME,
+           A.FQTY,
+           A.FREMAINSTOCKINQTY,
+           A.FPRICE,
+           A.FTAXPRICE,
+           A.FENTRYTAXAMOUNT,
+           A.FAMOUNT_LC,
+           A.FALLAMOUNT,
+           A.FDELIVERYDATE,
+           CASE
+               WHEN A.FGIVEAWAY = '1' THEN N'是'
+               WHEN A.FGIVEAWAY = '0' THEN N'否'
+               ELSE '' END,
+           A.FENTRYNOTE,
+           CASE
+               WHEN A.FMRPCLOSESTATUS = 'A' THEN N'未关闭'
+               WHEN A.FMRPCLOSESTATUS = 'B' THEN N'业务关闭'
+               ELSE '' END,
+           A.F_JSYJ,
+           A.FMANUALCLOSE,
+           H.FNAME,
+           A.FCLOSEDATE,
+           I.FNAME,
+           CASE
+               WHEN A.FMRPTERMINATESTATUS = 'A' THEN N'正常'
+               WHEN A.FMRPTERMINATESTATUS = 'B' THEN N'业务终止'
+               ELSE '' END,
+           GETDATE()
+    FROM TMP_PUR_ORDER_DETAIL A
+             LEFT JOIN T_BAS_BILLTYPE_L B ON A.FBILLTYPEID = B.FBILLTYPEID AND B.FLOCALEID = 2052
+             LEFT JOIN T_BD_PAYMENTCONDITION_L C ON A.FPAYCONDITIONID_ID = C.FID AND C.FLOCALEID = 2052
+             LEFT JOIN T_BD_SUPPLIER_L D ON A.FSUPPLIERID_ID = D.FSUPPLIERID AND D.FLOCALEID = 2052
+             LEFT JOIN T_BD_MATERIAL E ON A.FMATERIALID_ID = E.FMATERIALID
+             LEFT JOIN T_BD_MATERIAL_L EL ON A.FMATERIALID_ID = EL.FMATERIALID AND EL.FLOCALEID = 2052
+             LEFT JOIN T_BD_CURRENCY_L F ON A.FLOCALCURRID_ID = F.FCURRENCYID AND F.FLOCALEID = 2052
+             LEFT JOIN T_BD_UNIT_L G ON A.FUNITID_ID = G.FUNITID AND G.FLOCALEID = 2052
+             LEFT JOIN T_SEC_USER H ON A.FCLOSERID_ID = H.FUSERID
+             LEFT JOIN T_SEC_USER I ON A.FCREATORID_ID = I.FUSERID;
+    -- 准备采购订单数据 END
+
+    -- 数据写入结果表中 START
+    -- 取销售出库金额、期末库存金额
+    SELECT @SAL_OUT_AMOUNT = SUM(T.PRICE * T.FSTOCKOUTQTY),
+           @SAL_JC_AMOUNT = SUM(T.PRICE * T.FSTOCKJCQTY)
+    FROM MID_MATERIAL_PSI T
+    WHERE T.FSTOCKNUMBER IN (N'CK003', N'CK033', N'CK007')
+      AND T.DSIMONTH = @PSI_MONTH
+      AND T.DSIWEEK = @PSI_WEEK;
+
+    -- 取采购出库金额、期末库存金额
+    SELECT @PUR_OUT_AMOUNT = SUM(T.PRICE * T.FSTOCKOUTQTY),
+           @PUR_JC_AMOUNT = SUM(T.PRICE * T.FSTOCKJCQTY)
+    FROM MID_MATERIAL_PSI T
+    WHERE T.FSTOCKNUMBER IN (N'CK001', N'CK002', N'CK004', N'CK008', N'CK016',
+                             N'CK017', N'CK019', N'CK020', N'CK022')
+      AND T.DSIMONTH = @PSI_MONTH
+      AND T.DSIWEEK = @PSI_WEEK;
+
+    -- 取销售订单金额
+    SELECT @SAL_SAL_AMOUNT = SUM(T.AMOUNT)
+    FROM MID_SAL_ORDER_DETAIL T
+    WHERE T.DSIMONTH = @PSI_MONTH
+      AND T.DSIWEEK = @PSI_WEEK;
+
+    -- 取采购订单金额
+    SELECT @PUR_SAL_AMOUNT = SUM(T.AMOUNT)
+    FROM MID_PUR_ORDER_DETAIL T
+    WHERE T.DSIMONTH = @PSI_MONTH
+      AND T.DSIWEEK = @PSI_WEEK;
+
+    --  销售数据写入结果表
+    INSERT INTO T_DSI_RESULT(DSIMONTH, DSIWEEK, OUTAMOUNT, ORDERAMOUNT, ENDAMOUNT, DSITYPE)
+    VALUES (@PSI_MONTH, @PSI_WEEK, @SAL_OUT_AMOUNT, @SAL_SAL_AMOUNT, @SAL_JC_AMOUNT, 'S');
+    -- 采购数据写入结果表
+    INSERT INTO T_DSI_RESULT(DSIMONTH, DSIWEEK, OUTAMOUNT, ORDERAMOUNT, ENDAMOUNT, DSITYPE)
+    VALUES (@PSI_MONTH, @PSI_WEEK, @PUR_OUT_AMOUNT, @PUR_SAL_AMOUNT, @PUR_JC_AMOUNT, 'P');
+
+    -- 更新周度期初库存金额
+    UPDATE T_DSI_RESULT
+    SET BEGINAMOUNT = (SELECT TT.ENDAMOUNT
+                       FROM (SELECT ROW_NUMBER() OVER (ORDER BY T.DSIWEEK DESC) RN,
+                                    T.DSIWeek,
+                                    T.ENDAMOUNT
+                             FROM T_DSI_RESULT T
+                             WHERE T.DSITYPE = T_DSI_RESULT.DSITYPE
+                               AND T.DSIWEEK LIKE '%W%'
+                               AND T.DSIWEEK < @PSI_WEEK) TT
+                       WHERE TT.RN = 1)
+    WHERE DSIWEEK = @PSI_WEEK
+      AND DSIMONTH = @PSI_MONTH;
+
+    -- 更新完工入库金额、周均库存金额
+    UPDATE T_DSI_RESULT
+    SET INAMOUNT        = ENDAMOUNT - BEGINAMOUNT + OUTAMOUNT,
+        AVGWEEKLYAMOUNT = (BEGINAMOUNT + ENDAMOUNT) / 2,
+        OUTINRATIO      = OUTAMOUNT / (ENDAMOUNT - BEGINAMOUNT + OUTAMOUNT)
+    WHERE DSIWEEK = @PSI_WEEK
+      AND DSIMONTH = @PSI_MONTH;
+
+    -- 生成库存周转天数、存货周转天数、平局库存周转率、目标库存周转率、目标值差异、是否达标
+    UPDATE T_DSI_RESULT
+    SET INVRATIO    = OUTAMOUNT / AVGWEEKLYAMOUNT,
+        DSI         = AVGWEEKLYAMOUNT / OUTAMOUNT * 7,
+        AVGRATIO    = OUTAMOUNT / AVGWEEKLYAMOUNT,
+        TARGETRATIO = 0.75,
+        TARGETDIFF  = (OUTAMOUNT / AVGWEEKLYAMOUNT) - 0.75,
+        ISTARGET    = IIF((OUTAMOUNT / AVGWEEKLYAMOUNT) - 0.75 > 0, N'是', N'否'),
+        CREATEDATE  = GETDATE()
+    WHERE DSIWEEK = @PSI_WEEK
+      AND DSIMONTH = @PSI_MONTH;
+
+    -- 月度数据写入结果表
+    INSERT INTO T_DSI_RESULT(DSIMONTH, DSIWEEK, OUTAMOUNT, ORDERAMOUNT, ENDAMOUNT, DSITYPE)
+    SELECT @PSI_MONTH, @PSI_MONTH, SUM(T.OUTAMOUNT), SUM(T.ORDERAMOUNT), SUM(T.ENDAMOUNT), T.DSITYPE
+    FROM T_DSI_RESULT T
+    WHERE T.DSIMONTH = @PSI_MONTH
+    GROUP BY T.DSITYPE;
+
+    -- 更新月度期初库存金额
+    UPDATE T_DSI_RESULT
+    SET BEGINAMOUNT = (SELECT TT.ENDAMOUNT
+                       FROM (SELECT ROW_NUMBER() OVER (ORDER BY A.DSIMONTH DESC) RN,
+                                    A.DSIMonth,
+                                    A.DSIWeek,
+                                    A.ENDAMOUNT
+                             FROM T_DSI_RESULT A
+                             WHERE A.DSITYPE = T_DSI_RESULT.DSITYPE
+                               AND A.DSIWEEK LIKE 'M%'
+                               AND A.DSIWeek NOT LIKE '%W%'
+                               AND A.DSIWEEK < @PSI_MONTH) TT
+                       WHERE TT.RN = 1)
+    WHERE DSIMONTH = @PSI_MONTH
+      AND DSIWEEK = @PSI_MONTH;
+
+    -- 更新完工入库金额、周均库存金额
+    UPDATE T_DSI_RESULT
+    SET INAMOUNT        = ENDAMOUNT - BEGINAMOUNT + OUTAMOUNT,
+        AVGWEEKLYAMOUNT = (BEGINAMOUNT + ENDAMOUNT) / 2,
+        OUTINRATIO      = OUTAMOUNT / (ENDAMOUNT - BEGINAMOUNT + OUTAMOUNT)
+    WHERE DSIWEEK = @PSI_MONTH
+      AND DSIMONTH = @PSI_MONTH;
+
+    -- 生成库存周转天数、存货周转天数、平局库存周转率、目标库存周转率、目标值差异、是否达标
+    UPDATE T_DSI_RESULT
+    SET INVRATIO    = OUTAMOUNT / AVGWEEKLYAMOUNT,
+        DSI         = AVGWEEKLYAMOUNT / OUTAMOUNT * DAY(EOMONTH(GETDATE())),
+        AVGRATIO    = OUTAMOUNT / AVGWEEKLYAMOUNT,
+        TARGETRATIO = 3,
+        TARGETDIFF  = (OUTAMOUNT / AVGWEEKLYAMOUNT) - 3,
+        ISTARGET    = IIF((OUTAMOUNT / AVGWEEKLYAMOUNT) - 3 > 0, N'是', N'否'),
+        CREATEDATE  = GETDATE()
+    WHERE DSIWEEK = @PSI_MONTH
+      AND DSIMONTH = @PSI_MONTH;
+    -- 数据写入结果表中 END
+
+END
+go
