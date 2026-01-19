@@ -1,0 +1,256 @@
+// 定时任务执行
+
+using Kingdee.BOS;
+using Kingdee.BOS.App.Data;
+using Kingdee.BOS.Contracts;
+using Kingdee.BOS.Core;
+using Kingdee.BOS.Core.Report;
+using Kingdee.BOS.Util;
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Globalization;
+
+namespace VOIR.QYBG.SCM.DOI.PlugIn
+{
+    public class GetStockInventery : IScheduleService
+    {
+        GetCustomRpt getCustomRpt = new GetCustomRpt();
+
+        public void Run(Context ctx, Schedule schedule)
+        {
+            if (schedule.Parameters.IsNullOrEmpty())
+            {
+                return;
+            }
+
+            // 读取 schedule 参数并解析为日期（稳健处理），然后按规则计算目标周四
+            string parameters = schedule.Parameters;
+            DateTime inputDate;
+            if (!DateTime.TryParseExact(parameters, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out inputDate))
+            {
+                // 解析失败则使用当天日期作为输入
+                inputDate = DateTime.Now.Date;
+            }
+
+            // 把星期转换为 ISO 周序号：周一=1 ... 周日=7
+            int isoDay = ((int)inputDate.DayOfWeek + 6) % 7 + 1;
+
+            // 目标为周四（ISO：4）
+            // 若当前为 4,5,6,7 -> 使用本周周四；若为 1,2,3 -> 使用上周周四
+            int targetIso = 4;
+            DateTime dsiDate;
+            if (isoDay >= targetIso)
+            {
+                // 本周周四
+                dsiDate = inputDate.AddDays(targetIso - isoDay).Date;
+            }
+            else
+            {
+                // 上周周四
+                dsiDate = inputDate.AddDays(targetIso - isoDay - 7).Date;
+            }
+
+            // 把日期格式化为 SQL 字符串并带单引号，避免生成未加引号的字面量（导致 '00' 附近语法错误）
+            string dsiDateStr = dsiDate.AddDays(-1).Date.ToString("yyyy-MM-dd");
+            string dsiDateQuoted = $"'{dsiDateStr}'";
+
+            string updateSql = string.Format(@"/*dialect*/ 
+                    (SELECT T.c.value('(IsolationOrgListSetting)[1]', 'VARCHAR(10)') AS IsolationOrgListSetting,
+                      T.c.value('(FilterSetting)[1]', 'NVARCHAR(MAX)')         AS FilterSetting,
+                      T.c.value('(QuickFilterSetting)[1]', 'NVARCHAR(MAX)')    AS QuickFilterSetting,
+                      T.c.value('(SortSetting)[1]', 'NVARCHAR(MAX)')           AS SortSetting,
+                      T.c.value('(BatchFilterSetting)[1]', 'NVARCHAR(MAX)')    AS BatchFilterSetting,
+                      T.c.value('(ColumnSetting)[1]', 'NVARCHAR(MAX)')         AS ColumnSetting,
+                      REPLACE(REPLACE(T.c.value('(CustomFilterSetting)[1]', 'NVARCHAR(MAX)'),
+                                      '<EndDate>' + SUBSTRING(T.c.value('(CustomFilterSetting)[1]', 'NVARCHAR(MAX)'),
+                                                              CHARINDEX('<EndDate>',
+                                                                        T.c.value('(CustomFilterSetting)[1]', 'NVARCHAR(MAX)')) +
+                                                              9,
+                                                              CHARINDEX('</EndDate>',
+                                                                        T.c.value('(CustomFilterSetting)[1]', 'NVARCHAR(MAX)')) -
+                                                              CHARINDEX('<EndDate>',
+                                                                        T.c.value('(CustomFilterSetting)[1]', 'NVARCHAR(MAX)')) -
+                                                              9
+                                                    ) + '</EndDate>',
+                                      '<EndDate>' + CONVERT(VARCHAR(10), {0}, 120) + '</EndDate>'),
+                              '<BeginDate>' + SUBSTRING(T.c.value('(CustomFilterSetting)[1]', 'NVARCHAR(MAX)'),
+                                                        CHARINDEX('<BeginDate>',
+                                                                  T.c.value('(CustomFilterSetting)[1]', 'NVARCHAR(MAX)')) +
+                                                        11,
+                                                        CHARINDEX('</BeginDate>',
+                                                                  T.c.value('(CustomFilterSetting)[1]', 'NVARCHAR(MAX)')) -
+                                                        CHARINDEX('<BeginDate>',
+                                                                  T.c.value('(CustomFilterSetting)[1]', 'NVARCHAR(MAX)')) -
+                                                        11
+                                              ) + '</BeginDate>',
+                              '<BeginDate>' + CONVERT(VARCHAR(10), DATEADD(DAY, -6, {1}), 120) + '</BeginDate>'
+                      )                                                        AS CustomFilterSetting,
+                      T.c.value('(SummarySetting)[1]', 'NVARCHAR(MAX)')        AS SummarySetting
+               FROM FSCHEME.nodes('/SchemeEntity') AS T(c)
+               FOR XML PATH('SchemeEntity'))
+                ", dsiDateQuoted, dsiDateQuoted);
+
+            Dictionary<int, IMoveReport> rtnDIc =
+                getCustomRpt.getCustomRptData(ctx, "STK_StockSummaryRpt", "STK_StockSummaryFilter", "691d8fd7864c2a", updateSql);
+
+            Dictionary<int, IMoveReport> rtnDIc1 =
+                getCustomRpt.getCustomRptData(ctx, "STK_InvAgeAnalyzeRpt", "STK_InvAgeAnalyzeFilter", "694de401fb56f0", "FSCHEMEID");
+
+            List <SqlParam> fileList = new List<SqlParam> {
+                new SqlParam("@MaterialPsiTempTableName", DbType.AnsiString, rtnDIc[0].DataSource.TableName),
+                new SqlParam("@DSI_DATE", DbType.AnsiString, dsiDate),
+                new SqlParam("@INVAgeAnalyzeRPTTableName", DbType.AnsiString, rtnDIc1[0].DataSource.TableName)
+            };
+
+            DBUtils.ExecuteStoreProcedure(ctx, "VOIR_QYBG_SCM_DOI_UpdateMaterialPsi", fileList);
+        }
+    }
+}
+
+
+using Kingdee.BOS;
+using Kingdee.BOS.App.Data;
+using Kingdee.BOS.Core.DynamicForm;
+using Kingdee.BOS.Core.Metadata;
+using Kingdee.BOS.Core.Report;
+using Kingdee.BOS.Model.ReportFilter;
+using Kingdee.BOS.Orm.DataEntity;
+using Kingdee.BOS.Serialization;
+using Kingdee.BOS.ServiceHelper;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+
+namespace VOIR.QYBG.SCM.DOI.PlugIn
+{
+    public class GetCustomRpt
+    {
+
+        private FormMetadata _reportMetadata = null;
+        private IRptParams _rptParam = null;
+
+        /// <summary>
+        /// 获取分页账表数据
+        /// </summary>
+        /// <param name="ctx">执行上下文</param>
+        /// <param name="rptFormId">账表FormId</param>
+        /// <param name="rptFilterFormId">账表过滤方案FormId</param>
+        /// <param name="schemeId">过滤方案内码</param>
+        /// 数据写入 rtnDIc返回配置数据
+
+        public Dictionary<int, IMoveReport> getCustomRptData(Context ctx, string rptFormId, string rptFilterFormId, string rptFormIdFilter, string UpdateSql)
+        {
+            Dictionary<int, IMoveReport> rtnDIc = new Dictionary<int, IMoveReport>();
+            updateFschemeByFileterFormId(ctx, rptFormId, rptFormIdFilter, UpdateSql);
+            var rpt = GetReportData(ctx, rptFormId, rptFilterFormId, rptFormIdFilter, 0);
+            rtnDIc[0] = rpt;
+
+            if (rpt.ListCount > 1)
+            {
+                for (int i = 1; i < rpt.ListCount; i++)
+                {
+                    var tmpRpt = GetReportData(ctx, i);
+                    rtnDIc[i] = tmpRpt;
+                }
+            }
+
+            return rtnDIc;
+        }
+
+        private void updateFschemeByFileterFormId(Context ctx, string rptFormId, string rptFormIdFilter, string UpdateText)
+        {
+            string sql = string.Format(@"/*dialect*/ 
+                update T_BAS_FILTERSCHEME
+                set FSCHEME = {0}
+                WHERE FFORMID = '{1}' AND FSCHEMEID = '{2}'", UpdateText, rptFormId, rptFormIdFilter);
+
+            DBUtils.Execute(ctx, sql);
+        }
+
+        /// <summary>
+        /// 获取分页账表数据
+        /// </summary>
+        /// <param name="ctx">执行上下文</param>
+        /// <param name="rptFormId">账表FormId</param>
+        /// <param name="rptFilterFormId">账表过滤方案FormId</param>
+        /// <param name="schemeId">过滤方案内码</param>
+        /// <param name="currentPosition">分页账表当前位置</param>
+        /// <returns></returns>
+        private IMoveReport GetReportData(Context ctx, string rptFormId, string rptFilterFormId, string schemeId, int currentPosition)
+        {
+            var filterMetadata = FormMetaDataCache.GetCachedFilterMetaData(ctx);
+            // 加载分页报表元数据
+            var reportMetadata = FormMetaDataCache.GetCachedFormMetaData(ctx, rptFormId);
+            // 加载分页报表过滤条件框元数据
+            var reportFilterMetadata = FormMetaDataCache.GetCachedFormMetaData(ctx, rptFilterFormId);
+            var reportFilterServiceProvider = reportFilterMetadata.BusinessInfo.GetForm().GetFormServiceProvider();
+            var model = new SysReportFilterModel();
+            model.SetContext(ctx, reportFilterMetadata.BusinessInfo, reportFilterServiceProvider);
+            model.FormId = reportFilterMetadata.BusinessInfo.GetForm().Id;
+            model.FilterObject.FilterMetaData = filterMetadata;
+            model.InitFieldList(reportMetadata, reportFilterMetadata);
+            model.GetSchemeList();
+            var entity = model.Load(schemeId);
+            var dyn = DeserializeCustomFilter(reportFilterMetadata.BusinessInfo, entity.CustomFilterSetting);
+            model.DataObject = dyn;
+            var filter = model.GetFilterParameter();
+            IRptParams rptParam = new RptParams();
+            rptParam.FormId = reportFilterMetadata.BusinessInfo.GetForm().Id;
+            // 分页账表当前位置
+            rptParam.CurrentPosition = currentPosition;
+            // StartRow和EndRow是报表数据分页的起始行数和截至行数，一般取所有数据，所以EndRow取int最大值。
+            rptParam.StartRow = 1;
+            rptParam.EndRow = int.MaxValue;
+            rptParam.FilterParameter = filter;
+            rptParam.FilterFieldInfo = model.FilterFieldInfo;
+            var dic = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            foreach (var itemProp in dyn.DynamicObjectType.Properties)
+            {
+                dic[itemProp.Name] = dyn[itemProp.Name];
+            }
+            rptParam.CustomParams.Add("OpenParameter", dic);
+            // 赋值给全局变量，给后续查询使用
+            this._reportMetadata = reportMetadata;
+            this._rptParam = rptParam;
+            // 查询数据
+            MoveReportServiceParameter param = new MoveReportServiceParameter(ctx, reportMetadata.BusinessInfo, Guid.NewGuid().ToString(), rptParam);
+            return SysReportServiceHelper.GetListAndReportData(param);
+        }
+
+        /// <summary>
+        /// 获取自定义参数
+        /// </summary>
+        /// <param name="businessInfo">过滤方案元数据</param>
+        /// <param name="xml"></param>
+        /// <returns></returns>
+        private DynamicObject DeserializeCustomFilter(BusinessInfo businessInfo, string xml)
+        {
+            DcxmlBinder binder = new DynamicObjectDcxmlBinder(businessInfo);
+            binder.OnlyDbProperty = false;
+            DcxmlSerializer target = new DcxmlSerializer(binder);
+            // 切换到中性语言，获取主差量
+            binder.Culture = CultureInfo.InvariantCulture;
+            // 集合忽略主键冲突
+            target.ColloctionIgnorePKValue = true;
+            DynamicObject obj = (DynamicObject)target.DeserializeFromString(xml, null);
+            return obj;
+        }
+
+        /// <summary>
+        /// 获取分页账表数据
+        /// </summary>
+        /// <param name="ctx">执行上下文</param>
+        /// <param name="currentPosition">分页账表当前位置</param>
+        /// <returns></returns>
+        private IMoveReport GetReportData(Context ctx, int currentPosition)
+        {
+            // 更新分页下标
+            this._rptParam.CurrentPosition = currentPosition;
+            // 查询数据
+            MoveReportServiceParameter param = new MoveReportServiceParameter(ctx, this._reportMetadata.BusinessInfo, Guid.NewGuid().ToString(), this._rptParam);
+            return SysReportServiceHelper.GetListAndReportData(param);
+        }
+    }
+}
+
