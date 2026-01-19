@@ -1,0 +1,393 @@
+import clr
+
+clr.AddReference('Kingdee.BOS.App')
+clr.AddReference('Kingdee.BOS.ServiceHelper')
+clr.AddReference('System')
+clr.AddReference('System.Data')
+clr.AddReference('Kingdee.BOS')
+clr.AddReference('Kingdee.BOS.Core')
+clr.AddReference('NPOI')
+clr.AddReference('NPOI.OOXML')
+
+from Kingdee.BOS.App.Data import *
+from Kingdee.BOS.ServiceHelper import *
+from Kingdee.BOS import *
+from Kingdee.BOS.Core import *
+from Kingdee.BOS.Core.Bill import *
+from Kingdee.BOS.Core.Metadata import *
+from Kingdee.BOS.Core.DynamicForm.PlugIn import *
+from Kingdee.BOS.Core.DynamicForm.PlugIn.ControlModel import *
+from System import *
+from System.Data import *
+from System.Collections.Generic import List
+from Kingdee.BOS.Util import *
+from NPOI.XSSF.UserModel import *
+from System.IO import *
+from System import DateTime
+
+# DynamicForm 显示类型
+from Kingdee.BOS.Core.DynamicForm import DynamicFormShowParameter, ShowType
+
+
+def OnLoad(e):
+    showSalData(10000)
+    showPurData(10000)
+
+
+def ButtonClick(e):
+    key = e.Key.ToUpperInvariant()  # 转为大写
+
+    if (key == "F_QYBG_Button_dvn".ToUpperInvariant()):
+        unitName = this.View.Model.GetValue("F_QYBG_Combo_uky")
+        # this.View.ShowMessage(unitName)
+        if (unitName == "元"):
+            unit = 1
+        else:
+            unit = 10000
+        showSalData(unit)
+        showPurData(unit)
+
+    if (key == "F_QYBG_Button_qtr".ToUpperInvariant()):
+        exportExcel()
+
+
+#   处理下拉列表框
+def AfterBindData(e):
+    dsiWeekSQL = ("""/*dialect*/select distinct t.DSIWeek from T_DSI_RESULT t
+                    where t.DSIWeek like '%W%'
+                    order by t.DSIWeek desc""")
+
+    dsiWeekData = DBServiceHelper.ExecuteDataSet(this.Context, dsiWeekSQL).Tables[0]
+    enumList = List[EnumItem]()
+
+    for i in range(len(dsiWeekData.Rows)):
+        enumItem = EnumItem()
+        enumItem.Caption = LocaleValue(dsiWeekData.Rows[i]["DSIWeek"], 2052)
+        enumItem.EnumId = dsiWeekData.Rows[i]["DSIWeek"]
+        enumItem.Value = dsiWeekData.Rows[i]["DSIWeek"]
+        enumList.Add(enumItem)
+
+    comboList = this.View.GetFieldEditor[ComboFieldEditor]("F_QYBG_Combo_83g", 0)
+    if (comboList <> None):
+        comboList.SetComboItems(enumList)
+    if (this.View.OpenParameter.Status == OperationStatus.ADDNEW):
+        this.View.Model.SetValue("F_ora_Year", dsiWeekData.Rows[0]["DSIWeek"], 0)
+
+
+def writeExcel(workbook, sql, index, beginRow):
+    # 执行 SQL
+    data = DBUtils.ExecuteDynamicObject(this.Context, sql)
+    if data is None or data.Count == 0:
+        this.View.ShowMessage("未找到导出数据。")
+        return
+
+    # 获取第一个工作表
+    sheet = workbook.GetSheetAt(index)
+
+    # 写入数据（从第三行开始，索引2）
+    startRow = beginRow
+    properties = data[0].DynamicObjectType.Properties
+    for r in range(data.Count):
+        row_index = startRow + r
+        row = sheet.GetRow(row_index)
+        if row is None:
+            row = sheet.CreateRow(row_index)
+        for c in range(len(properties)):
+            cell = row.GetCell(c)
+            if cell is None:
+                cell = row.CreateCell(c)
+            val = data[r][properties[c].Name]
+            cell.SetCellValue("" if val is None else val)
+
+
+def exportExcel():
+    dsiWeek = this.View.Model.GetValue("F_QYBG_Combo_83g")
+
+    this.View.ShowMessage(dsiWeek)
+
+    salSQL = ("""/*dialect*/select convert(varchar(40), t.saldate, 120)      as saldate,
+                                   billtype,
+                                   billno,
+                                   documentstatus,
+                                   custname,
+                                   deptname,
+                                   salusername,
+                                   closestatus,
+                                   materialnumber,
+                                   materialname,
+                                   unitname,
+                                   salqty,
+                                   remainoutqty,
+                                   salprice,
+                                   amount_lc,
+                                   amount,
+                                   convert(varchar(40), t.deliverydate, 120) as deliverydate,
+                                   note,
+                                   isfree,
+                                   mrpclosestatus,
+                                   recconditionnumber,
+                                   ispriceexcludetax,
+                                   isincludedtax,
+                                   dsimonth,
+                                   dsiweek,
+                                   convert(varchar(40), t.createdate, 120)   as createdate
+                            from MID_SAL_ORDER_DETAIL t
+                            where t.DSIWEEK = '{0}'""").format(dsiWeek)
+
+    purSql = ("""/*dialect*/select billtype,
+                                   businesstype,
+                                   billno,
+                                   convert(varchar(40), billdate, 120)     as billdate,
+                                   paycondition,
+                                   suppliername,
+                                   documentstatus,
+                                   purchaseorg,
+                                   closestatus,
+                                   materialnumber,
+                                   materialname,
+                                   materialspecification,
+                                   currencyname,
+                                   unitname,
+                                   purqty,
+                                   remainoutqty,
+                                   purprice,
+                                   taxprice,
+                                   entrytaxamount,
+                                   amount_lc,
+                                   amount,
+                                   convert(varchar(40), deliverydate, 120) as deliverydate,
+                                   isfree,
+                                   note,
+                                   mrpclosestatus,
+                                   jsyj,
+                                   manualclose,
+                                   closeusername,
+                                   closedate,
+                                   creatorid,
+                                   mrpterminatestatus,
+                                   dsimonth,
+                                   dsiweek,
+                                   convert(varchar(40), createdate, 120)   as createdate
+                            from MID_PUR_ORDER_DETAIL t
+                            where t.DSIWEEK = '{0}'""").format(dsiWeek)
+
+    materialPSISQL = ("""/*dialect*/select dsimonth,
+                                           dsiweek,
+                                           fmaterialnumber,
+                                           fmaterialname,
+                                           fmaterialmodel,
+                                           fownertypename,
+                                           fownername,
+                                           fstockname,
+                                           fstockunitname,
+                                           fstockqcqty,
+                                           fstockinqty,
+                                           fstockoutqty,
+                                           fstockjcqty,
+                                           fmaterialid,
+                                           fstockid,
+                                           fstocknumber,
+                                           price,
+                                           convert(varchar(40), CREATEDATE, 120) as CREATEDATE,
+                                           case
+                                               when t.pricesource = '1' then N'存货收发存单价（优先级：发出金额 > 收入金额 > 期末结存 > 期初结存）'
+                                               when t.pricesource = '2' then N'物料查询成本清单'
+                                               else N'无法获取' end              as pricesource
+                                    from MID_MATERIAL_PSI t
+                                    where t.DSIWEEK = '{0}'""").format(dsiWeek)
+
+    # 读取 Excel 模板
+    templatePath = r"D:\Program Files (x86)\Kingdee\K3Cloud\WebSite\TemplateFiles\财务详情信息模板.xlsx"
+    fs = FileStream(templatePath, FileMode.Open, FileAccess.Read)
+    workbook = XSSFWorkbook(fs)
+    fs.Close()
+
+    writeExcel(workbook, salSQL, 0, 1)
+    writeExcel(workbook, purSql, 1, 1)
+    writeExcel(workbook, materialPSISQL, 2, 1)
+
+    # 保存到临时目录
+    fileName = "财务详细信息_{0}.xlsx".format(DateTime.Now.ToString("yyyyMMddHHmmss"))
+    filePath = PathUtils.GetPhysicalPath(KeyConst.TEMPFILEPATH, fileName)
+    out_fs = FileStream(filePath, FileMode.Create, FileAccess.Write)
+    workbook.Write(out_fs)
+    out_fs.Close()
+
+    # 弹窗下载
+    serverUrl = PathUtils.GetServerPath(KeyConst.TEMPFILEPATH, fileName)
+    showParam = DynamicFormShowParameter()
+    showParam.FormId = "BOS_FileDownload"
+    showParam.OpenStyle.ShowType = ShowType.Modal
+    showParam.CustomComplexParams.Add("url", serverUrl)
+    this.View.ShowForm(showParam)
+
+
+# 加载、查询销售数据
+def showSalData(unit):
+    this.View.Model.DeleteEntryData("F_QYBG_Entity_yrr")
+
+    loadSQL = ("""/*dialect*/
+                SELECT row_number() over (ORDER BY T.DSIMonth, SUBSTRING(T.DSIWeek, 1, 1) DESC, T.DSIWeek) rn,
+                   DSIMonth,
+                   DSIWeek,
+                   CAST(OUTAMOUNT / {0} AS DECIMAL(18, 2))                          AS               OUTAMOUNT,
+                   IIF(INAMOUNT = 0, 0, CAST(OUTAMOUNT / INAMOUNT AS DECIMAL(18, 2))) AS               OUTINRATIO,
+                   CAST(ORDERAMOUNT / {0} AS DECIMAL(18, 2))                        AS               ORDERAMOUNT,
+                   CAST(BEGINAMOUNT / {0} AS DECIMAL(18, 2))                        AS               BEGINAMOUNT,
+                   CAST(INAMOUNT / {0} AS DECIMAL(18, 2))                           AS               INAMOUNT,
+                   CAST(ENDAMOUNT / {0} AS DECIMAL(18, 2))                          AS               ENDAMOUNT,
+                   CAST(AVGWEEKLYAMOUNT / {0} AS DECIMAL(18, 2))                    AS               AVGWEEKLYAMOUNT,
+                   CAST(INVRATIO AS DECIMAL(18, 2))                                   AS               INVRATIO,
+                   CAST(DSI AS DECIMAL(18, 2))                                        AS               DSI,
+                   CAST(AVGRATIO AS DECIMAL(18, 2))                                   AS               AVGRATIO,
+                   CAST(TARGETRATIO AS DECIMAL(18, 2))                                AS               TARGETRATIO,
+                   CAST(TARGETDIFF AS DECIMAL(18, 2))                                 AS               TARGETDIFF,
+                   ISTARGET,
+                   DSIType,
+                   CREATEDATE
+            FROM T_DSI_RESULT T
+            WHERE T.DSIType = 'S'""").format(unit)
+
+    # this.View.ShowMessage(loadSQL)
+    entryData = DBServiceHelper.ExecuteDataSet(this.Context, loadSQL)
+    if entryData is None or len(entryData.Tables[0].Rows) == 0:
+        return
+    # 绑定单据体数据
+    for i in range(len(entryData.Tables[0].Rows)):
+        this.View.Model.CreateNewEntryRow("F_QYBG_Entity_yrr")
+        dr = entryData.Tables[0].Rows[i]
+
+        FDSIMonth = dr["DSIMonth"] or ""
+        this.View.Model.SetValue("FDSIMonth", FDSIMonth, i)
+
+        FDSIWeek = dr["DSIWeek"] or ""
+        this.View.Model.SetValue("FDSIWeek", FDSIWeek, i)
+
+        FOUTAMOUNT = dr["OUTAMOUNT"] or 0
+        this.View.Model.SetValue("FOUTAMOUNT", FOUTAMOUNT, i)
+
+        FOUTINRATIO = dr["OUTINRATIO"] or ""
+        this.View.Model.SetValue("FOUTINRATIO", FOUTINRATIO, i)
+
+        FORDERAMOUNT = dr["ORDERAMOUNT"] or 0
+        this.View.Model.SetValue("FORDERAMOUNT", FORDERAMOUNT, i)
+
+        FBEGINAMOUNT = dr["BEGINAMOUNT"] or 0
+        this.View.Model.SetValue("FBEGINAMOUNT", FBEGINAMOUNT, i)
+
+        FINAMOUNT = dr["ENDAMOUNT"] or 0
+        this.View.Model.SetValue("FINAMOUNT", FINAMOUNT, i)
+
+        FENDAMOUNT = dr["AVGWEEKLYAMOUNT"] or 0
+        this.View.Model.SetValue("FENDAMOUNT", FENDAMOUNT, i)
+
+        FAVGWEEKLYAMOUNT = dr["INVRATIO"] or 0
+        this.View.Model.SetValue("FAVGWEEKLYAMOUNT", FAVGWEEKLYAMOUNT, i)
+
+        FDSI = dr["DSI"] or 0
+        this.View.Model.SetValue("FDSI", FDSI, i)
+
+        FAVGRATIO = dr["AVGRATIO"] or 0
+        this.View.Model.SetValue("FAVGRATIO", FAVGRATIO, i)
+
+        FTARGETRATIO = dr["TARGETRATIO"] or 0
+        this.View.Model.SetValue("FTARGETRATIO", FTARGETRATIO, i)
+
+        FTARGETDIFF = dr["TARGETDIFF"] or 0
+        this.View.Model.SetValue("FTARGETDIFF", FTARGETDIFF, i)
+
+        FISTARGET = dr["ISTARGET"] or 0
+        this.View.Model.SetValue("FISTARGET", FISTARGET, i)
+
+        FDSIType = dr["DSIType"] or ""
+        this.View.Model.SetValue("FDSIType", FDSIType, i)
+        #
+        # FCREATEDATE = dr["CREATEDATE"] or datetime.now().date()
+        # this.View.Model.SetValue("FCREATEDATE", FCREATEDATE, i)
+
+    this.View.UpdateView("F_QYBG_Entity_yrr")
+
+
+# 加载、查询采购数据
+def showPurData(unit):
+    this.View.Model.DeleteEntryData("F_QYBG_Entity_re5")
+    loadSQL = ("""/*dialect*/
+                SELECT row_number() over (ORDER BY T.DSIMonth, SUBSTRING(T.DSIWeek, 1, 1) DESC, T.DSIWeek) rn,
+                   DSIMonth,
+                   DSIWeek,
+                   CAST(OUTAMOUNT / {0} AS DECIMAL(18, 2))                          AS               OUTAMOUNT,
+                   IIF(INAMOUNT = 0, 0, CAST(OUTAMOUNT / INAMOUNT AS DECIMAL(18, 2))) AS               OUTINRATIO,
+                   CAST(ORDERAMOUNT / {0} AS DECIMAL(18, 2))                        AS               ORDERAMOUNT,
+                   CAST(BEGINAMOUNT / {0} AS DECIMAL(18, 2))                        AS               BEGINAMOUNT,
+                   CAST(INAMOUNT / {0} AS DECIMAL(18, 2))                           AS               INAMOUNT,
+                   CAST(ENDAMOUNT / {0} AS DECIMAL(18, 2))                          AS               ENDAMOUNT,
+                   CAST(AVGWEEKLYAMOUNT / {0} AS DECIMAL(18, 2))                    AS               AVGWEEKLYAMOUNT,
+                   CAST(INVRATIO AS DECIMAL(18, 2))                                   AS               INVRATIO,
+                   CAST(DSI AS DECIMAL(18, 2))                                        AS               DSI,
+                   CAST(AVGRATIO AS DECIMAL(18, 2))                                   AS               AVGRATIO,
+                   CAST(TARGETRATIO AS DECIMAL(18, 2))                                AS               TARGETRATIO,
+                   CAST(TARGETDIFF AS DECIMAL(18, 2))                                 AS               TARGETDIFF,
+                   ISTARGET,
+                   DSIType,
+                   CREATEDATE
+            FROM T_DSI_RESULT T
+            WHERE T.DSIType = 'P'""").format(unit)
+
+    # this.View.ShowMessage(loadSQL)
+    entryData = DBServiceHelper.ExecuteDataSet(this.Context, loadSQL)
+    if entryData is None or len(entryData.Tables[0].Rows) == 0:
+        return
+    # 绑定单据体数据
+    for i in range(len(entryData.Tables[0].Rows)):
+        this.View.Model.CreateNewEntryRow("F_QYBG_Entity_re5")
+        dr = entryData.Tables[0].Rows[i]
+
+        FDSIMonth = dr["DSIMonth"] or ""
+        this.View.Model.SetValue("FPDSIMonth", FDSIMonth, i)
+
+        FDSIWeek = dr["DSIWeek"] or ""
+        this.View.Model.SetValue("FPDSIWeek", FDSIWeek, i)
+
+        FOUTAMOUNT = dr["OUTAMOUNT"] or 0
+        this.View.Model.SetValue("FPOUTAMOUNT", FOUTAMOUNT, i)
+
+        FOUTINRATIO = dr["OUTINRATIO"] or ""
+        this.View.Model.SetValue("FPOUTINRATIO", FOUTINRATIO, i)
+
+        FORDERAMOUNT = dr["ORDERAMOUNT"] or 0
+        this.View.Model.SetValue("FPORDERAMOUNT", FORDERAMOUNT, i)
+
+        FBEGINAMOUNT = dr["BEGINAMOUNT"] or 0
+        this.View.Model.SetValue("FPBEGINAMOUNT", FBEGINAMOUNT, i)
+
+        FINAMOUNT = dr["ENDAMOUNT"] or 0
+        this.View.Model.SetValue("FPINAMOUNT", FINAMOUNT, i)
+
+        FENDAMOUNT = dr["AVGWEEKLYAMOUNT"] or 0
+        this.View.Model.SetValue("FPENDAMOUNT", FENDAMOUNT, i)
+
+        FAVGWEEKLYAMOUNT = dr["INVRATIO"] or 0
+        this.View.Model.SetValue("FPAVGWEEKLYAMOUNT", FAVGWEEKLYAMOUNT, i)
+
+        FDSI = dr["DSI"] or 0
+        this.View.Model.SetValue("FPDSI", FDSI, i)
+
+        FAVGRATIO = dr["AVGRATIO"] or 0
+        this.View.Model.SetValue("FPAVGRATIO", FAVGRATIO, i)
+
+        FTARGETRATIO = dr["TARGETRATIO"] or 0
+        this.View.Model.SetValue("FPTARGETRATIO", FTARGETRATIO, i)
+
+        FTARGETDIFF = dr["TARGETDIFF"] or 0
+        this.View.Model.SetValue("FPTARGETDIFF", FTARGETDIFF, i)
+
+        FISTARGET = dr["ISTARGET"] or 0
+        this.View.Model.SetValue("FPISTARGET", FISTARGET, i)
+
+        FDSIType = dr["DSIType"] or ""
+        this.View.Model.SetValue("FPDSIType", FDSIType, i)
+        #
+        # FCREATEDATE = dr["CREATEDATE"] or datetime.now().date()
+        # this.View.Model.SetValue("FCREATEDATE", FCREATEDATE, i)
+
+    this.View.UpdateView("F_QYBG_Entity_re5")
